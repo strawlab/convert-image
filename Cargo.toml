@@ -1,9 +1,15 @@
 [package]
 name = "convert-image"
+description = "conversion functions to convert between image formats"
 version = "0.1.0"
 authors = ["Andrew Straw <strawman@astraw.com>"]
 edition = "2021"
 rust-version = "1.76"
+license = "MIT/Apache-2.0"
+readme = "README.md"
+keywords = ["cameras", "images"]
+repository = "https://github.com/strawlab/convert-image"
+categories = ["multimedia::images", "computer-vision"]
 
 [dependencies]
 machine-vision-formats = "0.1.3"
