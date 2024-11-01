@@ -13,4 +13,4 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 thiserror = "1"
 bayer = { version = "0.1", default-features = false }
-itertools = "0.10.3"
+itertools = "0.13"
