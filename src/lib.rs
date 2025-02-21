@@ -774,6 +774,26 @@ where
                     nv12_into_mono8(&nv12, &mut dest_mono8)?;
                     Ok(())
                 }
+                formats::pixel_format::PixFmt::BayerRG8
+                | formats::pixel_format::PixFmt::BayerGB8
+                | formats::pixel_format::PixFmt::BayerGR8
+                | formats::pixel_format::PixFmt::BayerBG8 => {
+                    // .. from bayer.
+                    // Convert Bayer first to RGB
+                    let width: usize = source.width().try_into().unwrap();
+                    let height: usize = source.height().try_into().unwrap();
+                    let stride = width * 3;
+                    let mut rgb_buf = &mut vec![0u8; stride * height];
+                    let mut tmp_rgb =
+                        ImageRefMut::new(source.width(), source.height(), stride, &mut rgb_buf)
+                            .unwrap();
+                    // The bayer code requires no padding in the input image.
+                    let exact_stride = remove_padding(source)?;
+                    bayer_into_rgb(&exact_stride, &mut tmp_rgb)?;
+                    // Then to mono8
+                    rgb8_into_mono8(&tmp_rgb, &mut dest_mono8)?;
+                    Ok(())
+                }
                 _ => Err(Error::UnimplementedConversion(src_fmt, dest_fmt)),
             }
         }
