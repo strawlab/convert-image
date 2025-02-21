@@ -491,7 +491,7 @@ impl<'a, F: PixelFormat> From<OImage<F>> for CowImage<'a, F> {
     }
 }
 
-impl<'a, F: PixelFormat> Stride for CowImage<'a, F> {
+impl<F: PixelFormat> Stride for CowImage<'_, F> {
     fn stride(&self) -> usize {
         match self {
             CowImage::Borrowed(im) => im.stride(),
@@ -500,7 +500,7 @@ impl<'a, F: PixelFormat> Stride for CowImage<'a, F> {
     }
 }
 
-impl<'a, F: PixelFormat> ImageData<F> for CowImage<'a, F> {
+impl<F: PixelFormat> ImageData<F> for CowImage<'_, F> {
     fn width(&self) -> u32 {
         match self {
             CowImage::Borrowed(im) => im.width(),
@@ -783,10 +783,9 @@ where
                     let width: usize = source.width().try_into().unwrap();
                     let height: usize = source.height().try_into().unwrap();
                     let stride = width * 3;
-                    let mut rgb_buf = &mut vec![0u8; stride * height];
+                    let rgb_buf = &mut vec![0u8; stride * height];
                     let mut tmp_rgb =
-                        ImageRefMut::new(source.width(), source.height(), stride, &mut rgb_buf)
-                            .unwrap();
+                        ImageRefMut::new(source.width(), source.height(), stride, rgb_buf).unwrap();
                     // The bayer code requires no padding in the input image.
                     let exact_stride = remove_padding(source)?;
                     bayer_into_rgb(&exact_stride, &mut tmp_rgb)?;
@@ -825,7 +824,7 @@ enum SupportedEncoding<'a> {
     Mono(Box<dyn HasRowChunksExact<formats::pixel_format::Mono8> + 'a>),
 }
 
-impl<'a> SupportedEncoding<'a> {
+impl SupportedEncoding<'_> {
     #[inline]
     fn width(&self) -> u32 {
         match self {
@@ -989,6 +988,89 @@ where
     Ok(result)
 }
 
+fn encode_into_nv12_inner<FMT>(
+    frame: &dyn HasRowChunksExact<FMT>,
+    dest: &mut ImageBufferMutRef<NV12>,
+    dest_stride: usize,
+) -> Result<()>
+where
+    FMT: PixelFormat,
+{
+    use itertools::izip;
+
+    let frame = to_rgb8_or_mono8(frame)?;
+
+    let luma_size = frame.height() as usize * dest_stride;
+
+    let (nv12_luma, nv12_chroma) = dest.data.split_at_mut(luma_size);
+
+    match &frame {
+        SupportedEncoding::Mono(frame) => {
+            // ported from convertYUVpitchtoNV12 in NvEncoder.cpp
+            let w = frame.width() as usize;
+            for y in 0..frame.height() as usize {
+                let start = dest_stride * y;
+                let src = frame.stride() * y;
+                nv12_luma[start..(start + w)].copy_from_slice(&frame.image_data()[src..(src + w)]);
+            }
+
+            for y in 0..(frame.height() as usize / 2) {
+                let start = dest_stride * y;
+                for x in (0..frame.width() as usize).step_by(2) {
+                    nv12_chroma[start + x] = 128u8;
+                    nv12_chroma[start + (x + 1)] = 128u8;
+                }
+            }
+        }
+        SupportedEncoding::Rgb(frame) => {
+            let w = frame.width() as usize;
+
+            // Allocate temporary storage for full-res chroma planes.
+            // TODO: eliminate this or make it much smaller (e.g. two rows).
+            let mut u_plane_full: Vec<u8> = vec![0; nv12_luma.len()];
+            let mut v_plane_full: Vec<u8> = vec![0; nv12_luma.len()];
+
+            for (src_row, dest_row, udest_row, vdest_row) in izip![
+                frame.image_data().chunks_exact(frame.stride()),
+                nv12_luma.chunks_exact_mut(dest_stride),
+                u_plane_full.chunks_exact_mut(dest_stride),
+                v_plane_full.chunks_exact_mut(dest_stride),
+            ] {
+                let yuv_iter = src_row[..w * 3]
+                    .chunks_exact(3)
+                    .map(|rgb| RGB888toYUV444_bt601_full_swing(rgb[0], rgb[1], rgb[2]));
+
+                let dest_iter = dest_row[0..w].iter_mut();
+
+                for (ydest, udest, vdest, yuv) in izip![dest_iter, udest_row, vdest_row, yuv_iter] {
+                    *ydest = yuv.Y;
+                    *udest = yuv.U;
+                    *vdest = yuv.V;
+                }
+            }
+
+            // Now downsample the full-res chroma planes.
+            let half_stride = dest_stride; // This is not half because the two channels are interleaved.
+            for y in 0..(frame.height() as usize / 2) {
+                for x in 0..(frame.width() as usize / 2) {
+                    let u_sum: u16 = u_plane_full[dest_stride * 2 * y + 2 * x] as u16
+                        + u_plane_full[dest_stride * 2 * y + 2 * x + 1] as u16
+                        + u_plane_full[dest_stride * (2 * y + 1) + 2 * x] as u16
+                        + u_plane_full[dest_stride * (2 * y + 1) + 2 * x + 1] as u16;
+                    let v_sum: u16 = v_plane_full[dest_stride * 2 * y + 2 * x] as u16
+                        + v_plane_full[dest_stride * 2 * y + 2 * x + 1] as u16
+                        + v_plane_full[dest_stride * (2 * y + 1) + 2 * x] as u16
+                        + v_plane_full[dest_stride * (2 * y + 1) + 2 * x + 1] as u16;
+
+                    nv12_chroma[(half_stride * y) + 2 * x] = (u_sum / 4) as u8;
+                    nv12_chroma[(half_stride * y) + 2 * x + 1] = (v_sum / 4) as u8;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::*;
@@ -1032,13 +1114,13 @@ mod tests {
         }
     }
 
-    impl<'a, F> Stride for RoiImage<'a, F> {
+    impl<F> Stride for RoiImage<'_, F> {
         fn stride(&self) -> usize {
             self.stride
         }
     }
 
-    impl<'a, F> ImageData<F> for RoiImage<'a, F> {
+    impl<F> ImageData<F> for RoiImage<'_, F> {
         fn width(&self) -> u32 {
             self.w
         }
@@ -1325,87 +1407,4 @@ mod tests {
         assert_eq!(orig.image_data(), actual.image_data());
         Ok(())
     }
-}
-
-fn encode_into_nv12_inner<FMT>(
-    frame: &dyn HasRowChunksExact<FMT>,
-    dest: &mut ImageBufferMutRef<NV12>,
-    dest_stride: usize,
-) -> Result<()>
-where
-    FMT: PixelFormat,
-{
-    use itertools::izip;
-
-    let frame = to_rgb8_or_mono8(frame)?;
-
-    let luma_size = frame.height() as usize * dest_stride;
-
-    let (nv12_luma, nv12_chroma) = dest.data.split_at_mut(luma_size);
-
-    match &frame {
-        SupportedEncoding::Mono(frame) => {
-            // ported from convertYUVpitchtoNV12 in NvEncoder.cpp
-            let w = frame.width() as usize;
-            for y in 0..frame.height() as usize {
-                let start = dest_stride * y;
-                let src = frame.stride() * y;
-                nv12_luma[start..(start + w)].copy_from_slice(&frame.image_data()[src..(src + w)]);
-            }
-
-            for y in 0..(frame.height() as usize / 2) {
-                let start = dest_stride * y;
-                for x in (0..frame.width() as usize).step_by(2) {
-                    nv12_chroma[start + x] = 128u8;
-                    nv12_chroma[start + (x + 1)] = 128u8;
-                }
-            }
-        }
-        SupportedEncoding::Rgb(frame) => {
-            let w = frame.width() as usize;
-
-            // Allocate temporary storage for full-res chroma planes.
-            // TODO: eliminate this or make it much smaller (e.g. two rows).
-            let mut u_plane_full: Vec<u8> = vec![0; nv12_luma.len()];
-            let mut v_plane_full: Vec<u8> = vec![0; nv12_luma.len()];
-
-            for (src_row, dest_row, udest_row, vdest_row) in izip![
-                frame.image_data().chunks_exact(frame.stride()),
-                nv12_luma.chunks_exact_mut(dest_stride),
-                u_plane_full.chunks_exact_mut(dest_stride),
-                v_plane_full.chunks_exact_mut(dest_stride),
-            ] {
-                let yuv_iter = src_row[..w * 3]
-                    .chunks_exact(3)
-                    .map(|rgb| RGB888toYUV444_bt601_full_swing(rgb[0], rgb[1], rgb[2]));
-
-                let dest_iter = dest_row[0..w].iter_mut();
-
-                for (ydest, udest, vdest, yuv) in izip![dest_iter, udest_row, vdest_row, yuv_iter] {
-                    *ydest = yuv.Y;
-                    *udest = yuv.U;
-                    *vdest = yuv.V;
-                }
-            }
-
-            // Now downsample the full-res chroma planes.
-            let half_stride = dest_stride; // This is not half because the two channels are interleaved.
-            for y in 0..(frame.height() as usize / 2) {
-                for x in 0..(frame.width() as usize / 2) {
-                    let u_sum: u16 = u_plane_full[dest_stride * 2 * y + 2 * x] as u16
-                        + u_plane_full[dest_stride * 2 * y + 2 * x + 1] as u16
-                        + u_plane_full[dest_stride * (2 * y + 1) + 2 * x] as u16
-                        + u_plane_full[dest_stride * (2 * y + 1) + 2 * x + 1] as u16;
-                    let v_sum: u16 = v_plane_full[dest_stride * 2 * y + 2 * x] as u16
-                        + v_plane_full[dest_stride * 2 * y + 2 * x + 1] as u16
-                        + v_plane_full[dest_stride * (2 * y + 1) + 2 * x] as u16
-                        + v_plane_full[dest_stride * (2 * y + 1) + 2 * x + 1] as u16;
-
-                    nv12_chroma[(half_stride * y) + 2 * x] = (u_sum / 4) as u8;
-                    nv12_chroma[(half_stride * y) + 2 * x + 1] = (v_sum / 4) as u8;
-                }
-            }
-        }
-    }
-    Ok(())
 }
