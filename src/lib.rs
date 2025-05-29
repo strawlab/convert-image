@@ -10,12 +10,12 @@ use bayer as wang_debayer;
 use machine_vision_formats as formats;
 
 use formats::{
+    cow::CowImage,
     image_ref::{ImageRef, ImageRefMut},
     iter::{HasRowChunksExact, HasRowChunksExactMut},
     owned::OImage,
     pixel_format::{Mono8, NV12, RGB8},
-    ImageBuffer, ImageBufferMutRef, ImageBufferRef, ImageData, OwnedImageStride, PixFmt,
-    PixelFormat, Stride,
+    ImageBufferMutRef, OwnedImageStride, PixFmt, PixelFormat,
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -471,60 +471,6 @@ where
         Ok(CowImage::Owned(
             OImage::new(frame.width(), frame.height(), dest_stride, dest_buf).unwrap(),
         ))
-    }
-}
-
-enum CowImage<'a, F: PixelFormat> {
-    Borrowed(ImageRef<'a, F>),
-    Owned(OImage<F>),
-}
-
-impl<'a, F: PixelFormat> From<ImageRef<'a, F>> for CowImage<'a, F> {
-    fn from(frame: ImageRef<'a, F>) -> CowImage<'a, F> {
-        CowImage::Borrowed(frame)
-    }
-}
-
-impl<'a, F: PixelFormat> From<OImage<F>> for CowImage<'a, F> {
-    fn from(frame: OImage<F>) -> CowImage<'a, F> {
-        CowImage::Owned(frame)
-    }
-}
-
-impl<F: PixelFormat> Stride for CowImage<'_, F> {
-    fn stride(&self) -> usize {
-        match self {
-            CowImage::Borrowed(im) => im.stride(),
-            CowImage::Owned(im) => im.stride(),
-        }
-    }
-}
-
-impl<F: PixelFormat> ImageData<F> for CowImage<'_, F> {
-    fn width(&self) -> u32 {
-        match self {
-            CowImage::Borrowed(im) => im.width(),
-            CowImage::Owned(im) => im.width(),
-        }
-    }
-    fn height(&self) -> u32 {
-        match self {
-            CowImage::Borrowed(im) => im.height(),
-            CowImage::Owned(im) => im.height(),
-        }
-    }
-    fn buffer_ref(&self) -> ImageBufferRef<'_, F> {
-        let image_data = match self {
-            CowImage::Borrowed(im) => im.image_data(),
-            CowImage::Owned(im) => im.image_data(),
-        };
-        ImageBufferRef::new(image_data)
-    }
-    fn buffer(self) -> ImageBuffer<F> {
-        match self {
-            CowImage::Borrowed(im) => ImageBuffer::new(im.image_data().to_vec()),
-            CowImage::Owned(im) => ImageBuffer::new(im.into()),
-        }
     }
 }
 
@@ -1074,6 +1020,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use formats::{ImageBuffer, ImageBufferRef, ImageData, Stride};
 
     /// An RoiImage maintains a reference to the original image but views a
     /// subregion of the original data.
