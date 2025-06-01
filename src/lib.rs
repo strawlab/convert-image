@@ -644,6 +644,7 @@ where
         ] {
             dest_row[..nbytes].copy_from_slice(&src_row[..nbytes]);
         }
+        return Ok(());
     }
 
     match dest_fmt {
