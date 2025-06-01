@@ -43,6 +43,22 @@ pub enum Error {
     UnimplementedConversion(PixFmt, PixFmt),
 }
 
+#[inline]
+const fn calc_min_stride(w: u32, pixfmt: PixFmt) -> usize {
+    w as usize * pixfmt.bits_per_pixel() as usize / 8
+}
+
+#[inline]
+const fn calc_min_buf_size(w: u32, h: u32, stride: usize, pixfmt: PixFmt) -> usize {
+    if h == 0 {
+        return 0;
+    }
+    let all_but_last = (h - 1) as usize * stride;
+    let last = calc_min_stride(w, pixfmt);
+    debug_assert!(stride >= last);
+    all_but_last + last
+}
+
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 #[derive(PartialEq, Eq, Debug)]
@@ -206,23 +222,15 @@ fn yuv422_into_rgb(
 
 fn into_yuv444<FMT>(
     frame: &dyn HasRowChunksExact<FMT>,
-    dest: &mut ImageBufferMutRef<YUV444>,
-    dest_stride: usize,
+    dest: &mut dyn HasRowChunksExactMut<machine_vision_formats::pixel_format::YUV444>,
 ) -> Result<()>
 where
     FMT: PixelFormat,
 {
-    let w = frame.width() as usize;
-    // The destination must be at least this large per row.
-    let min_stride = w * 3;
-    if dest_stride < min_stride {
-        return Err(Error::InvalidAllocatedBufferStride);
-    }
-
-    let expected_size = dest_stride * frame.height() as usize;
-    if dest.data.len() != expected_size {
+    if frame.width() != dest.width() || frame.height() != dest.height() {
         return Err(Error::InvalidAllocatedBufferSize);
     }
+    let w = frame.width() as usize;
 
     // Convert to Mono8 or RGB8 TODO: if input encoding is YUV already, do
     // something better than this. We can assume that it won't be YUV444 because
@@ -233,11 +241,7 @@ where
 
     match &frame {
         SupportedEncoding::Mono(mono) => {
-            for (dest_row, src_row) in dest
-                .data
-                .chunks_exact_mut(dest_stride)
-                .zip(mono.image_data().chunks_exact(mono.stride()))
-            {
+            for (dest_row, src_row) in dest.rowchunks_exact_mut().zip(mono.rowchunks_exact()) {
                 for (dest_pixel, src_pixel) in
                     dest_row[..(w * 3)].chunks_exact_mut(3).zip(&src_row[..w])
                 {
@@ -253,11 +257,7 @@ where
             }
         }
         SupportedEncoding::Rgb(rgb) => {
-            for (dest_row, src_row) in dest
-                .data
-                .chunks_exact_mut(dest_stride)
-                .zip(rgb.image_data().chunks_exact(rgb.stride()))
-            {
+            for (dest_row, src_row) in dest.rowchunks_exact_mut().zip(rgb.rowchunks_exact()) {
                 for (dest_pixel, src_pixel) in dest_row[..(w * 3)]
                     .chunks_exact_mut(3)
                     .zip(src_row[..(w * 3)].chunks_exact(3))
@@ -498,18 +498,41 @@ where
 /// the underlying data, but rather changes only the rust type. See
 /// [force_pixel_format] for a function which consumes the original data and
 /// moves it into the output.
-pub fn force_pixel_format_ref<'a, FMT1, FMT2>(
-    frame: &'a dyn HasRowChunksExact<FMT1>,
-) -> ImageRef<'a, FMT2>
+///
+/// For a mutable version of this function, see [force_pixel_format_ref_mut].
+pub fn force_pixel_format_ref<FMT1, FMT2>(frame: &dyn HasRowChunksExact<FMT1>) -> ImageRef<'_, FMT2>
 where
-    FMT1: 'a,
-    FMT2: 'a + PixelFormat,
+    FMT2: PixelFormat,
 {
     ImageRef::new(
         frame.width(),
         frame.height(),
         frame.stride(),
         frame.image_data(),
+    )
+    .unwrap()
+}
+
+/// Force interpretation of data from frame into another pixel_format.
+///
+/// This makes a view of the original data and does not perform conversion of
+/// the underlying data, but rather changes only the rust type. See
+/// [force_pixel_format] for a function which consumes the original data and
+/// moves it into the output.
+///
+/// This is a mutable version of [force_pixel_format_ref].
+fn force_pixel_format_ref_mut<FMT1, FMT2>(
+    frame: &mut dyn HasRowChunksExactMut<FMT1>,
+) -> ImageRefMut<'_, FMT2>
+where
+    FMT1: PixelFormat,
+    FMT2: PixelFormat,
+{
+    ImageRefMut::new(
+        frame.width(),
+        frame.height(),
+        frame.stride(),
+        frame.buffer_mut_ref().data,
     )
     .unwrap()
 }
@@ -596,11 +619,10 @@ where
     }
 
     // Allocate minimal size buffer for new image.
-    let dest_min_stride = dest_fmt.bits_per_pixel() as usize * source.width() as usize / 8;
-    let dest_size = source.height() as usize * dest_min_stride;
+    let dest_stride = calc_min_stride(source.width(), dest_fmt);
+    let dest_size = calc_min_buf_size(source.width(), source.height(), dest_stride, dest_fmt);
     let image_data = vec![0u8; dest_size];
-    let mut dest =
-        OImage::new(source.width(), source.height(), dest_min_stride, image_data).unwrap();
+    let mut dest = OImage::new(source.width(), source.height(), dest_stride, image_data).unwrap();
 
     // Fill the new buffer.
     convert_into(source, &mut dest)?;
@@ -626,23 +648,19 @@ where
     let src_fmt = machine_vision_formats::pixel_format::pixfmt::<SRC>().unwrap();
     let dest_fmt = machine_vision_formats::pixel_format::pixfmt::<DEST>().unwrap();
 
+    if dest.width() != source.width() || dest.height() != source.height() {
+        return Err(Error::InvalidAllocatedBufferSize);
+    }
+
     let dest_stride = dest.stride();
 
     // If format does not change, copy the data row-by-row to respect strides.
     if src_fmt == dest_fmt {
-        let dest_size = source.height() as usize * dest_stride;
-        if dest.buffer_mut_ref().data.len() != dest_size {
-            return Err(Error::InvalidAllocatedBufferSize);
-        }
-
         use itertools::izip;
-        let w = source.width() as usize;
-        let nbytes = dest_fmt.bits_per_pixel() as usize * w / 8;
-        for (src_row, dest_row) in izip![
-            source.image_data().chunks_exact(source.stride()),
-            dest.buffer_mut_ref().data.chunks_exact_mut(dest_stride),
-        ] {
-            dest_row[..nbytes].copy_from_slice(&src_row[..nbytes]);
+        let dest_stride = calc_min_stride(source.width(), dest_fmt);
+        for (src_row, dest_row) in izip![source.rowchunks_exact(), dest.rowchunks_exact_mut(),] {
+            debug_assert_eq!(src_row.len(), dest_stride);
+            dest_row[..dest_stride].copy_from_slice(src_row);
         }
         return Ok(());
     }
@@ -711,7 +729,6 @@ where
                 formats::pixel_format::PixFmt::YUV444 => {
                     // .. from YUV444.
                     let yuv444 = force_pixel_format_ref(source);
-                    // let mut mono8 = force_buffer_pixel_format_ref(&mut dest.buffer_mut_ref());
                     yuv444_into_mono8(&yuv444, &mut dest_mono8)?;
                     Ok(())
                 }
@@ -745,9 +762,9 @@ where
         }
         formats::pixel_format::PixFmt::YUV444 => {
             // Convert to YUV444.
-            // let mut dest2 = force_buffer_pixel_format_ref(&mut dest.buffer_mut_ref());
-            let mut dest2 = force_buffer_pixel_format_ref(dest.buffer_mut_ref());
-            into_yuv444(source, &mut dest2, dest_stride)?;
+            let mut dest2: ImageRefMut<'_, machine_vision_formats::pixel_format::YUV444> =
+                force_pixel_format_ref_mut(dest);
+            into_yuv444(source, &mut dest2)?;
             Ok(())
         }
         formats::pixel_format::PixFmt::NV12 => {
@@ -800,6 +817,24 @@ impl SupportedEncoding<'_> {
             SupportedEncoding::Mono(m) => m.image_data(),
         }
     }
+    #[inline]
+    fn rowchunks_exact(&self) -> machine_vision_formats::iter::RowChunksExact {
+        match self {
+            SupportedEncoding::Rgb(m) => m.rowchunks_exact(),
+            SupportedEncoding::Mono(m) => m.rowchunks_exact(),
+        }
+    }
+    #[inline]
+    fn pixfmt(&self) -> formats::pixel_format::PixFmt {
+        match self {
+            SupportedEncoding::Rgb(_) => {
+                machine_vision_formats::pixel_format::pixfmt::<RGB8>().unwrap()
+            }
+            SupportedEncoding::Mono(_) => {
+                machine_vision_formats::pixel_format::pixfmt::<Mono8>().unwrap()
+            }
+        }
+    }
 }
 
 /// If the input is Mono8, return as Mono8, otherwise, return as RGB8.
@@ -825,24 +860,30 @@ where
 {
     let frame = to_rgb8_or_mono8(frame)?;
 
-    let (coding, bytes_per_pixel) = match &frame {
-        SupportedEncoding::Mono(_) => (image::ColorType::L8, 1),
-        SupportedEncoding::Rgb(_) => (image::ColorType::Rgb8, 3),
+    let (coding, pixfmt) = match &frame {
+        SupportedEncoding::Mono(_) => {
+            let pixfmt = machine_vision_formats::pixel_format::pixfmt::<Mono8>().unwrap();
+            debug_assert_eq!(frame.pixfmt(), pixfmt);
+            (image::ColorType::L8, pixfmt)
+        }
+        SupportedEncoding::Rgb(_) => {
+            let pixfmt = machine_vision_formats::pixel_format::pixfmt::<RGB8>().unwrap();
+            debug_assert_eq!(frame.pixfmt(), pixfmt);
+            (image::ColorType::Rgb8, pixfmt)
+        }
     };
+
+    let packed_stride = calc_min_stride(frame.width(), pixfmt);
 
     // The encoders in the `image` crate only handle packed inputs. We check if
     // our data is packed and if not, make a packed copy.
 
     let mut packed = None;
-    let packed_stride = frame.width() as usize * bytes_per_pixel as usize;
     if frame.stride() != packed_stride {
-        let mut dest = Vec::with_capacity(packed_stride * frame.height() as usize);
-        let src = frame.image_data();
-        let chunk_iter = src.chunks_exact(frame.stride());
-        if !chunk_iter.remainder().is_empty() {
-            return Err(Error::InvalidAllocatedBufferSize);
-        }
-        for src_row in chunk_iter {
+        let dest_sz = calc_min_buf_size(frame.width(), frame.height(), packed_stride, pixfmt);
+        let mut dest = Vec::with_capacity(dest_sz);
+        for src_row in frame.rowchunks_exact() {
+            debug_assert_eq!(src_row.len(), packed_stride);
             dest.extend_from_slice(&src_row[..packed_stride]);
         }
         packed = Some(dest);
