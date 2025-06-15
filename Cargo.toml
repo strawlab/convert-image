@@ -1,7 +1,7 @@
 [package]
 name = "convert-image"
 description = "conversion functions to convert between image formats"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["Andrew Straw <strawman@astraw.com>"]
 edition = "2021"
 rust-version = "1.76"
