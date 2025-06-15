@@ -180,15 +180,14 @@ fn yuv422_into_rgb(
     src_yuv422: &dyn HasRowChunksExact<formats::pixel_format::YUV422>,
     dest_rgb: &mut dyn HasRowChunksExactMut<RGB8>,
 ) -> Result<()> {
+    if src_yuv422.width() != dest_rgb.width() || src_yuv422.height() != dest_rgb.height() {
+        return Err(Error::InvalidAllocatedBufferSize);
+    }
+
     // The destination must be at least this large per row.
     let min_stride = src_yuv422.width() as usize * PixFmt::RGB8.bits_per_pixel() as usize / 8;
     if dest_rgb.stride() < min_stride {
         return Err(Error::InvalidAllocatedBufferStride);
-    }
-
-    let expected_size = dest_rgb.stride() * src_yuv422.height() as usize;
-    if dest_rgb.buffer_mut_ref().data.len() != expected_size {
-        return Err(Error::InvalidAllocatedBufferSize);
     }
 
     let w = src_yuv422.width() as usize;
