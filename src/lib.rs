@@ -945,14 +945,11 @@ where
     let packed_stride = frame.width() as usize * bytes_per_pixel as usize;
     if frame.stride() != packed_stride {
         let mut dest = Vec::with_capacity(packed_stride * frame.height() as usize);
-        let src = frame.image_data();
-        let chunk_iter = src.chunks_exact(frame.stride());
-        if !chunk_iter.remainder().is_empty() {
-            return Err(Error::InvalidAllocatedBufferSize);
+
+        for src_row in frame.rowchunks_exact() {
+            dest.extend_from_slice(&src_row[..]);
         }
-        for src_row in chunk_iter {
-            dest.extend_from_slice(&src_row[..packed_stride]);
-        }
+
         packed = Some(dest);
     }
 
